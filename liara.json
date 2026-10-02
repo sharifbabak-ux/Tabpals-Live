@@ -1,0 +1,8 @@
+{
+  "platform": "node",
+  "app": "tabpals-live",
+  "port": 3000,
+  "node": {
+    "version": "20"
+  }
+}

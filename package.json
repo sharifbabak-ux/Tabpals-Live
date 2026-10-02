@@ -1,0 +1,19 @@
+{
+  "name": "tabpals-live",
+  "version": "0.1.0",
+  "description": "Tiny realtime server for TabPals (connectivity test)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/server.test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^4.21.2",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.1"
+  }
+}
