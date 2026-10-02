@@ -1,6 +1,6 @@
 {
   "platform": "node",
-  "app": "tabpals-live",
+  "app": "tabpals-api",
   "port": 3000,
   "node": {
     "version": "20"

@@ -80,7 +80,7 @@
   var ERR = { 'not-found':'اتاقی با این کد پیدا نشد.', 'room-full':'اتاق پر است.', 'bad-name':'نام را وارد کنید.',
               'rate-limit':'ارسال بیش از حد سریع است.', 'too-long':'پیام خیلی طولانی است.', 'not-in-room':'در اتاق نیستید.' };
   var s = { sent:0, recv:0, reconnects:0, lat:[], room:null };
-  var socket = io({ transports:['polling','websocket'], reconnection:true, reconnectionDelayMax:5000 });
+  var socket = io('/test', { transports:['polling','websocket'], reconnection:true, reconnectionDelayMax:5000 });
 
   function render() {
     $('cnt').textContent = fa(s.recv) + '/' + fa(s.sent);
