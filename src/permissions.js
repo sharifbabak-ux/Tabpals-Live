@@ -4,7 +4,12 @@ export const ROLES = ['admin', 'treasurer', 'member'];
 
 export const OP_TYPES = ['create', 'update', 'delete', 'archive', 'restore', 'purge', 'logSend'];
 
-// Writable only by treasurer or admin.
+// Sensitive field values may be end-to-end encrypted opaque strings; the server stores them verbatim
+// (subject to the normal op size limit) and never inspects or logs them.
+export const ENC_PREFIX = 'enc:v1:';
+export const isEncryptedValue = (v) => typeof v === 'string' && v.startsWith(ENC_PREFIX);
+
+// Writable only by treasurer or admin. Any of their fields may carry encrypted values.
 export const LEDGER_ENTITIES = [
   'events',
   'persons',
@@ -18,7 +23,8 @@ export const LEDGER_ENTITIES = [
   'sessionExtras',
 ];
 
-// Writable by the owning member (entityId === own memberId) and by admin.
+// Restricted entity. Writable by the owning member (entityId === own memberId), treasurer and admin.
+// Readable (GET ops and socket `ops`) by the same set of devices only.
 export const PROFILE_ENTITY = 'memberProfile';
 
 export const ENTITIES = [...LEDGER_ENTITIES, PROFILE_ENTITY];
@@ -30,6 +36,7 @@ export const ACTION_ROLES = {
   'members.add': ['admin', 'treasurer'],
   'roles.set': ['admin'],
   'invites.manage': ['admin'],
+  'members.remove': ['admin'], // also covers restore
   'devices.listAll': ['admin'],
   'devices.revokeAny': ['admin'], // a device may always revoke itself
   'audit.read': ['admin'],
@@ -38,6 +45,11 @@ export const ACTION_ROLES = {
 
 export const hasAny = (roles, allowed) => allowed.some((r) => roles.includes(r));
 export const can = (roles, action) => hasAny(roles, ACTION_ROLES[action] || []);
+
+const canAccessProfile = (actor, ownerId) => ownerId === actor.memberId || hasAny(actor.roles, ['admin', 'treasurer']);
+
+/** Whether a device (with current roles) may receive a stored op. Only memberProfile is restricted. */
+export const canReadOp = (actor, { entity, entityId }) => entity !== PROFILE_ENTITY || canAccessProfile(actor, entityId);
 
 /**
  * @param {{memberId: string, roles: string[]}} actor
@@ -49,9 +61,7 @@ export function checkOp(actor, op) {
   if (!OP_TYPES.includes(op.type)) return { ok: false, reason: 'unknown-type' };
   const isAdmin = actor.roles.includes('admin');
   if (op.entity === PROFILE_ENTITY) {
-    return isAdmin || op.entityId === actor.memberId
-      ? { ok: true }
-      : { ok: false, reason: 'forbidden-profile' };
+    return canAccessProfile(actor, op.entityId) ? { ok: true } : { ok: false, reason: 'forbidden-profile' };
   }
   if (op.entity === 'events' && op.type === 'purge' && !isAdmin) {
     return { ok: false, reason: 'forbidden-purge' };

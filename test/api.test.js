@@ -95,7 +95,7 @@ test('permission matrix unit checks', () => {
   assert.ok(checkOp(admin, op('orderLines')).ok);
   assert.ok(checkOp(member, op('memberProfile', 'update', 'm1')).ok);
   assert.equal(checkOp(member, op('memberProfile', 'update', 'm2')).reason, 'forbidden-profile');
-  assert.equal(checkOp(treasurer, op('memberProfile', 'update', 'm2')).reason, 'forbidden-profile');
+  assert.ok(checkOp(treasurer, op('memberProfile', 'update', 'm2')).ok);
   assert.ok(checkOp(admin, op('memberProfile', 'update', 'm2')).ok);
   assert.equal(checkOp(admin, op('nothing')).reason, 'unknown-entity');
   assert.equal(checkOp(admin, op('vouchers', 'explode')).reason, 'unknown-type');
@@ -266,8 +266,9 @@ test('socket: broadcast after accepted ops, roles-changed, auth required', async
   const sBob = srv.socket(bob);
   const sOther = srv.socket(other.alice);
   const sNone = srv.socket('nope'.repeat(10));
+  const noneErr = once(sNone, 'connect_error'); // attach before awaiting anything: real PostgreSQL answers fast
   await Promise.all([once(sBob, 'ready'), once(sOther, 'ready')]);
-  assert.equal((await once(sNone, 'connect_error')).data.code, 'unauthorized');
+  assert.equal((await noneErr).data.code, 'unauthorized');
 
   let leaked = false;
   sOther.on('ops', () => (leaked = true));

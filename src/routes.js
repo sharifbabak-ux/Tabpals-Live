@@ -5,11 +5,14 @@ import { authMiddleware, requireEventMember } from './auth.js';
 import { audit } from './audit.js';
 import { lockEvent } from './db.js';
 import { newId, newShortCode, newToken, normalizeShortCode, sha256 } from './crypto.js';
-import { ROLES, can, checkOp } from './permissions.js';
+import { ROLES, can, checkOp, hasAny } from './permissions.js';
 
 export const MAX_OPS_PER_BATCH = 500;
 export const MAX_OP_BYTES = 64 * 1024;
 const MAX_MEMBERS_PER_EVENT = 200;
+const MAX_PUBLIC_KEY_BYTES = 2048;
+const MAX_WRAPPED_KEY_BYTES = 4096;
+const MAX_ENVELOPE_META_BYTES = 1024;
 
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ENTITY_ID_RE = /^[\w.:-]{1,128}$/;
@@ -24,6 +27,41 @@ function need(cond, field) {
 function parseMember(m, field) {
   need(isObj(m) && ID_RE.test(m.memberId ?? '') && str(m.displayName, 80), field);
   return { memberId: m.memberId, displayName: clean(m.displayName) };
+}
+
+/** Accepts an ECDH P-256 public JWK (object or JSON string); returns the normalized JSON string. Rejects private keys. */
+function parsePublicKey(v, field = 'publicKey') {
+  let jwk = v;
+  if (typeof v === 'string') {
+    need(Buffer.byteLength(v) <= MAX_PUBLIC_KEY_BYTES, field);
+    try {
+      jwk = JSON.parse(v);
+    } catch {
+      need(false, field);
+    }
+  }
+  const coord = (c) => typeof c === 'string' && /^[A-Za-z0-9_-]{43}$/.test(c);
+  need(isObj(jwk) && jwk.kty === 'EC' && jwk.crv === 'P-256' && coord(jwk.x) && coord(jwk.y) && jwk.d === undefined, field);
+  return JSON.stringify({ kty: 'EC', crv: 'P-256', x: jwk.x, y: jwk.y });
+}
+const optionalPublicKey = (v) => (v === undefined || v === null ? null : parsePublicKey(v));
+
+/** Non-sensitive audit details for a logSend op: only ids, channel and timestamp, each strictly validated. */
+function statementSentDetails(op) {
+  const pick = (...names) => {
+    for (const n of names) {
+      for (const v of [op.changes?.[n]?.after, op.changes?.[n], op[n]]) {
+        if (typeof v === 'string' && /^[\w.:-]{1,128}$/.test(v)) return v;
+      }
+    }
+    return null;
+  };
+  return {
+    statementId: op.entityId,
+    targetMemberId: pick('targetMemberId', 'memberId', 'personId', 'recipientId'),
+    channel: pick('channel'),
+    timestamp: toClientTs(op.timestamp).toISOString(),
+  };
 }
 
 function toClientTs(v) {
@@ -71,6 +109,11 @@ export function buildRouter({ db, config, hub }) {
     limit: config.limits.redeemFailPer15Min,
     skipSuccessfulRequests: true, // carrier-grade NAT: only failed attempts count against an IP
   });
+  const envelopeLimiter = limited({
+    windowMs: 60_000,
+    limit: config.limits.envelopesPerMin,
+    keyGenerator: (req) => req.device.id,
+  });
   const opsLimiter = limited({
     windowMs: 60_000,
     limit: config.limits.opsPerMin,
@@ -93,6 +136,7 @@ export function buildRouter({ db, config, hub }) {
       need(str(b.title, 200), 'title');
       need(str(b.deviceLabel, 40), 'deviceLabel');
       const creator = parseMember(b.creator, 'creator');
+      const publicKey = optionalPublicKey(b.publicKey);
       need(b.members === undefined || (Array.isArray(b.members) && b.members.length <= MAX_MEMBERS_PER_EVENT), 'members');
       const members = new Map([[creator.memberId, creator]]);
       for (const m of b.members ?? []) {
@@ -124,12 +168,13 @@ export function buildRouter({ db, config, hub }) {
               ]);
             }
           }
-          await q.query('INSERT INTO devices (id, event_id, member_id, token_hash, label) VALUES ($1,$2,$3,$4,$5)', [
+          await q.query('INSERT INTO devices (id, event_id, member_id, token_hash, label, public_key) VALUES ($1,$2,$3,$4,$5,$6)', [
             deviceId,
             b.eventId,
             creator.memberId,
             sha256(token),
             clean(b.deviceLabel),
+            publicKey,
           ]);
           await audit(q, b.eventId, { memberId: creator.memberId, id: deviceId }, 'event.created', b.eventId, {
             memberCount: members.size,
@@ -151,7 +196,7 @@ export function buildRouter({ db, config, hub }) {
       const { eventId } = req.params;
       await db.tx(async (q) => {
         await lockEvent(q, eventId);
-        for (const t of ['ops', 'audit_log', 'invites', 'devices', 'member_roles', 'members']) {
+        for (const t of ['ops', 'audit_log', 'key_envelopes', 'invites', 'devices', 'member_roles', 'members']) {
           await q.query(`DELETE FROM ${t} WHERE event_id = $1`, [eventId]);
         }
         await q.query('DELETE FROM events WHERE id = $1', [eventId]);
@@ -223,6 +268,10 @@ export function buildRouter({ db, config, hub }) {
             [eventId, op.id, actor.id, actor.memberId, op.entity, op.entityId, op.type, JSON.stringify(op), clientTs],
           );
           fresh.push(row);
+          if (op.type === 'logSend') {
+            const d = statementSentDetails(op);
+            await audit(q, eventId, actor, 'statement.sent', d.statementId, d);
+          }
           accepted.push({ opId: op.id, seq: Number(row.seq) });
         }
         const [head] = await q.query('SELECT max(seq) AS s FROM ops WHERE event_id = $1', [eventId]);
@@ -241,10 +290,13 @@ export function buildRouter({ db, config, hub }) {
       const limit = req.query.limit === undefined ? 200 : Number(req.query.limit);
       need(Number.isInteger(after) && after >= 0, 'after');
       need(Number.isInteger(limit) && limit >= 1 && limit <= MAX_OPS_PER_BATCH, 'limit');
+      // memberProfile ops are delivered only to the owner, treasurers and admins (seq gaps are expected).
+      const restricted = !hasAny(req.device.roles, ['admin', 'treasurer']);
       const rows = await db.query(
         `SELECT seq, server_ts, member_id, device_id, payload FROM ops
-         WHERE event_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3`,
-        [req.params.eventId, after, limit + 1],
+         WHERE event_id = $1 AND seq > $2 ${restricted ? "AND (entity <> 'memberProfile' OR entity_id = $4)" : ''}
+         ORDER BY seq ASC LIMIT $3`,
+        restricted ? [req.params.eventId, after, limit + 1, req.device.memberId] : [req.params.eventId, after, limit + 1],
       );
       const hasMore = rows.length > limit;
       const ops = rows.slice(0, limit).map(opView);
@@ -259,7 +311,7 @@ export function buildRouter({ db, config, hub }) {
     wrap(async (req, res) => {
       const { eventId } = req.params;
       const [members, roles, devices] = await Promise.all([
-        db.query('SELECT member_id, display_name, created_at FROM members WHERE event_id = $1 ORDER BY created_at, member_id', [eventId]),
+        db.query('SELECT member_id, display_name, created_at, removed_at FROM members WHERE event_id = $1 ORDER BY created_at, member_id', [eventId]),
         db.query('SELECT member_id, role FROM member_roles WHERE event_id = $1', [eventId]),
         db.query('SELECT member_id FROM devices WHERE event_id = $1 AND revoked_at IS NULL', [eventId]),
       ]);
@@ -268,6 +320,7 @@ export function buildRouter({ db, config, hub }) {
           memberId: m.member_id,
           displayName: m.display_name,
           createdAt: new Date(m.created_at).toISOString(),
+          removedAt: m.removed_at ? new Date(m.removed_at).toISOString() : null,
           roles: ROLES.filter((role) => roles.some((x) => x.member_id === m.member_id && x.role === role)),
           activeDevices: devices.filter((d) => d.member_id === m.member_id).length,
         })),
@@ -310,8 +363,9 @@ export function buildRouter({ db, config, hub }) {
       await db.tx(async (q) => {
         await lockEvent(q, eventId);
         const cur = (await q.query('SELECT role FROM member_roles WHERE event_id = $1 AND member_id = $2', [eventId, memberId])).map((x) => x.role);
-        const known = await q.query('SELECT 1 AS x FROM members WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
-        if (!known.length) throw new ApiError('member-not-found');
+        const [known] = await q.query('SELECT removed_at FROM members WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
+        if (!known) throw new ApiError('member-not-found');
+        if (known.removed_at) throw new ApiError('member-removed');
         if (cur.includes('admin') && !next.includes('admin')) {
           const others = await q.query("SELECT member_id FROM member_roles WHERE event_id = $1 AND role = 'admin' AND member_id <> $2", [eventId, memberId]);
           if (!others.length) throw new ApiError('last-admin');
@@ -337,8 +391,9 @@ export function buildRouter({ db, config, hub }) {
       const { eventId } = req.params;
       const memberId = req.body?.memberId;
       need(typeof memberId === 'string' && ID_RE.test(memberId), 'memberId');
-      const [m] = await db.query('SELECT 1 AS x FROM members WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
+      const [m] = await db.query('SELECT removed_at FROM members WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
       if (!m) throw new ApiError('member-not-found');
+      if (m.removed_at) throw new ApiError('member-removed');
       const inviteToken = newToken();
       const shortCode = newShortCode();
       const id = newId();
@@ -352,6 +407,33 @@ export function buildRouter({ db, config, hub }) {
         await audit(q, eventId, req.device, 'invite.created', memberId, { inviteId: id });
       });
       res.status(201).json({ inviteId: id, inviteToken, shortCode, expiresAt: expiresAt.toISOString() });
+    }),
+  );
+
+  r.get(
+    '/events/:eventId/invites',
+    ...member,
+    wrap(async (req, res) => {
+      requireAction(req, 'invites.manage');
+      const rows = await db.query(
+        `SELECT id, member_id, created_at, expires_at, used_at, revoked_at, created_by_member FROM invites
+         WHERE event_id = $1 ORDER BY created_at, id`,
+        [req.params.eventId],
+      );
+      const iso = (v) => (v ? new Date(v).toISOString() : null);
+      const status = (i) =>
+        i.used_at ? 'used' : i.revoked_at ? 'revoked' : new Date(i.expires_at).getTime() <= Date.now() ? 'expired' : 'pending';
+      res.json({
+        invites: rows.map((i) => ({
+          inviteId: i.id,
+          memberId: i.member_id,
+          status: status(i),
+          createdAt: iso(i.created_at),
+          expiresAt: iso(i.expires_at),
+          usedAt: iso(i.used_at),
+          createdBy: i.created_by_member,
+        })),
+      });
     }),
   );
 
@@ -378,6 +460,7 @@ export function buildRouter({ db, config, hub }) {
     wrap(async (req, res) => {
       const { inviteToken, shortCode, deviceLabel } = req.body ?? {};
       need(str(deviceLabel, 40), 'deviceLabel');
+      const publicKey = optionalPublicKey(req.body?.publicKey);
       let hash;
       let column;
       if (typeof inviteToken === 'string' && inviteToken.length <= 128) {
@@ -400,12 +483,15 @@ export function buildRouter({ db, config, hub }) {
         // Atomic single use: only one concurrent redeemer can flip used_at.
         const won = await q.query('UPDATE invites SET used_at = now(), used_by_device = $2 WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL RETURNING id', [inv.id, deviceId]);
         if (!won.length) throw new ApiError('invite-used');
-        await q.query('INSERT INTO devices (id, event_id, member_id, token_hash, label) VALUES ($1,$2,$3,$4,$5)', [deviceId, inv.event_id, inv.member_id, sha256(token), clean(deviceLabel)]);
+        const [mem] = await q.query('SELECT removed_at FROM members WHERE event_id = $1 AND member_id = $2', [inv.event_id, inv.member_id]);
+        if (mem?.removed_at) throw new ApiError('member-removed');
+        await q.query('INSERT INTO devices (id, event_id, member_id, token_hash, label, public_key) VALUES ($1,$2,$3,$4,$5,$6)', [deviceId, inv.event_id, inv.member_id, sha256(token), clean(deviceLabel), publicKey]);
         await audit(q, inv.event_id, { memberId: inv.member_id, id: deviceId }, 'invite.redeemed', inv.member_id, { inviteId: inv.id });
         const roles = (await q.query('SELECT role FROM member_roles WHERE event_id = $1 AND member_id = $2', [inv.event_id, inv.member_id])).map((x) => x.role);
         const [ev] = await q.query('SELECT title FROM events WHERE id = $1', [inv.event_id]);
         return { eventId: inv.event_id, memberId: inv.member_id, roles: ROLES.filter((x) => roles.includes(x)), eventTitle: ev.title };
       });
+      if (publicKey) hub.keyNeeded(out.eventId, deviceId, out.memberId);
       res.json({ ...out, deviceToken: token, deviceId });
     }),
   );
@@ -445,10 +531,151 @@ export function buildRouter({ db, config, hub }) {
       if (d.id !== req.device.id) requireAction(req, 'devices.revokeAny');
       await db.tx(async (q) => {
         const done = await q.query('UPDATE devices SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL RETURNING id', [deviceId]);
+        await q.query('DELETE FROM key_envelopes WHERE target_device_id = $1', [deviceId]);
         if (done.length) await audit(q, eventId, req.device, 'device.revoked', d.member_id, { deviceId });
       });
       hub.deviceRevoked(deviceId);
       res.json({ ok: true });
+    }),
+  );
+
+  // ---- member removal -----------------------------------------------------------------------
+  r.delete(
+    '/events/:eventId/members/:memberId',
+    ...member,
+    wrap(async (req, res) => {
+      requireAction(req, 'members.remove');
+      const { eventId, memberId } = req.params;
+      const revoked = await db.tx(async (q) => {
+        await lockEvent(q, eventId);
+        const [m] = await q.query('SELECT removed_at FROM members WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
+        if (!m) throw new ApiError('member-not-found');
+        if (m.removed_at) return null; // already removed: idempotent
+        const isAdmin = await q.query("SELECT 1 AS x FROM member_roles WHERE event_id = $1 AND member_id = $2 AND role = 'admin'", [eventId, memberId]);
+        if (isAdmin.length) {
+          const others = await q.query("SELECT member_id FROM member_roles WHERE event_id = $1 AND role = 'admin' AND member_id <> $2", [eventId, memberId]);
+          if (!others.length) throw new ApiError('last-admin');
+        }
+        const devices = (await q.query('SELECT id FROM devices WHERE event_id = $1 AND member_id = $2', [eventId, memberId])).map((d) => d.id);
+        await q.query('UPDATE devices SET revoked_at = now() WHERE event_id = $1 AND member_id = $2 AND revoked_at IS NULL', [eventId, memberId]);
+        for (const id of devices) await q.query('DELETE FROM key_envelopes WHERE target_device_id = $1', [id]);
+        await q.query('UPDATE invites SET revoked_at = now() WHERE event_id = $1 AND member_id = $2 AND used_at IS NULL AND revoked_at IS NULL', [eventId, memberId]);
+        await q.query('DELETE FROM member_roles WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
+        await q.query('UPDATE members SET removed_at = now() WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
+        await audit(q, eventId, req.device, 'member.removed', memberId, { deviceCount: devices.length });
+        return devices;
+      });
+      if (revoked) {
+        hub.memberRemoved(eventId, memberId);
+        revoked.forEach((id) => hub.deviceRevoked(id));
+      }
+      res.json({ ok: true });
+    }),
+  );
+
+  r.post(
+    '/events/:eventId/members/:memberId/restore',
+    ...member,
+    wrap(async (req, res) => {
+      requireAction(req, 'members.remove');
+      const { eventId, memberId } = req.params;
+      await db.tx(async (q) => {
+        await lockEvent(q, eventId);
+        const [m] = await q.query('SELECT removed_at FROM members WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
+        if (!m) throw new ApiError('member-not-found');
+        if (!m.removed_at) return;
+        await q.query('UPDATE members SET removed_at = NULL WHERE event_id = $1 AND member_id = $2', [eventId, memberId]);
+        await audit(q, eventId, req.device, 'member.restored', memberId);
+      });
+      res.json({ ok: true, memberId, roles: [] });
+    }),
+  );
+
+  // ---- E2E key distribution (server stores opaque data only) --------------------------------
+  r.put(
+    '/devices/me/public-key',
+    auth,
+    small,
+    wrap(async (req, res) => {
+      const publicKey = parsePublicKey(req.body?.publicKey);
+      const d = req.device;
+      await db.tx(async (q) => {
+        const [cur] = await q.query('SELECT public_key FROM devices WHERE id = $1', [d.id]);
+        // An envelope wrapped for a previous key is useless to the new key pair.
+        if (cur?.public_key !== publicKey) await q.query('DELETE FROM key_envelopes WHERE target_device_id = $1', [d.id]);
+        await q.query('UPDATE devices SET public_key = $2 WHERE id = $1', [d.id, publicKey]);
+      });
+      const has = await db.query('SELECT 1 AS x FROM key_envelopes WHERE target_device_id = $1', [d.id]);
+      if (!has.length) hub.keyNeeded(d.eventId, d.id, d.memberId);
+      res.json({ ok: true });
+    }),
+  );
+
+  r.get(
+    '/events/:eventId/devices/awaiting-key',
+    ...member,
+    wrap(async (req, res) => {
+      const rows = await db.query(
+        `SELECT d.id, d.member_id, d.label, d.public_key FROM devices d
+         JOIN members m ON m.event_id = d.event_id AND m.member_id = d.member_id
+         LEFT JOIN key_envelopes k ON k.target_device_id = d.id
+         WHERE d.event_id = $1 AND d.revoked_at IS NULL AND m.removed_at IS NULL AND d.public_key IS NOT NULL
+           AND k.id IS NULL
+         ORDER BY d.created_at, d.id`,
+        [req.params.eventId],
+      );
+      res.json({
+        devices: rows.map((d) => ({ deviceId: d.id, memberId: d.member_id, label: d.label, publicKey: d.public_key })),
+      });
+    }),
+  );
+
+  r.post(
+    '/events/:eventId/key-envelopes',
+    ...member,
+    envelopeLimiter,
+    small,
+    wrap(async (req, res) => {
+      const { eventId } = req.params;
+      const { targetDeviceId, wrappedKey } = req.body ?? {};
+      const meta = req.body?.meta ?? null;
+      need(typeof targetDeviceId === 'string' && ID_RE.test(targetDeviceId), 'targetDeviceId');
+      need(typeof wrappedKey === 'string' && wrappedKey.length > 0 && Buffer.byteLength(wrappedKey) <= MAX_WRAPPED_KEY_BYTES, 'wrappedKey');
+      need(meta === null || Buffer.byteLength(JSON.stringify(meta)) <= MAX_ENVELOPE_META_BYTES, 'meta');
+      need(targetDeviceId !== req.device.id, 'targetDeviceId');
+      await db.tx(async (q) => {
+        await lockEvent(q, eventId);
+        const [t] = await q.query(
+          `SELECT d.id FROM devices d JOIN members m ON m.event_id = d.event_id AND m.member_id = d.member_id
+           WHERE d.id = $1 AND d.event_id = $2 AND d.revoked_at IS NULL AND m.removed_at IS NULL`,
+          [targetDeviceId, eventId],
+        );
+        if (!t) throw new ApiError('device-not-found');
+        await q.query('DELETE FROM key_envelopes WHERE target_device_id = $1', [targetDeviceId]);
+        await q.query(
+          'INSERT INTO key_envelopes (id, event_id, target_device_id, from_device_id, wrapped_key, meta) VALUES ($1,$2,$3,$4,$5,$6)',
+          [newId(), eventId, targetDeviceId, req.device.id, wrappedKey, meta === null ? null : JSON.stringify(meta)],
+        );
+        await audit(q, eventId, req.device, 'key.delivered', targetDeviceId, { fromDevice: req.device.id, toDevice: targetDeviceId });
+      });
+      hub.keyDelivered(targetDeviceId, req.device.id);
+      res.json({ ok: true });
+    }),
+  );
+
+  r.get(
+    '/devices/me/key-envelope',
+    auth,
+    wrap(async (req, res) => {
+      const [e] = await db.query('SELECT from_device_id, wrapped_key, meta, created_at FROM key_envelopes WHERE target_device_id = $1', [req.device.id]);
+      if (!e) throw new ApiError('not-found');
+      res.set('Cache-Control', 'no-store');
+      res.json({
+        fromDeviceId: e.from_device_id,
+        wrappedKey: e.wrapped_key,
+        meta: typeof e.meta === 'string' ? JSON.parse(e.meta) : e.meta,
+        createdAt: new Date(e.created_at).toISOString(),
+      });
     }),
   );
 

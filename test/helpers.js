@@ -3,7 +3,7 @@ import { createApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { migrate, wrapPool } from '../src/db.js';
 
-const TABLES = ['audit_log', 'ops', 'invites', 'devices', 'member_roles', 'members', 'events', 'schema_migrations'];
+const TABLES = ['key_envelopes', 'audit_log', 'ops', 'invites', 'devices', 'member_roles', 'members', 'events', 'schema_migrations'];
 
 async function makeDb() {
   if (process.env.DATABASE_URL_TEST) {
