@@ -39,6 +39,10 @@ export function attachRealtime(httpServer, { db, config }) {
       io.to(deviceRoom(deviceId)).emit('device-revoked', { deviceId });
       io.in(deviceRoom(deviceId)).disconnectSockets(true);
     },
+    memberRemoved: (eventId, memberId) => io.to(eventRoom(eventId)).emit('member-removed', { memberId }),
+    keyNeeded: (eventId, deviceId, memberId) => io.to(eventRoom(eventId)).emit('key-needed', { deviceId, memberId }),
+    keyDelivered: (targetDeviceId, fromDeviceId) =>
+      io.to(deviceRoom(targetDeviceId)).emit('key-delivered', { deviceId: targetDeviceId, fromDeviceId }),
     eventPurged(eventId) {
       io.to(eventRoom(eventId)).emit('event-purged', { eventId });
       io.in(eventRoom(eventId)).disconnectSockets(true);

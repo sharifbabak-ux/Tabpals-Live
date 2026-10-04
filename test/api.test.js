@@ -266,8 +266,9 @@ test('socket: broadcast after accepted ops, roles-changed, auth required', async
   const sBob = srv.socket(bob);
   const sOther = srv.socket(other.alice);
   const sNone = srv.socket('nope'.repeat(10));
+  const noneErr = once(sNone, 'connect_error'); // attach before awaiting anything: real PostgreSQL answers fast
   await Promise.all([once(sBob, 'ready'), once(sOther, 'ready')]);
-  assert.equal((await once(sNone, 'connect_error')).data.code, 'unauthorized');
+  assert.equal((await noneErr).data.code, 'unauthorized');
 
   let leaked = false;
   sOther.on('ops', () => (leaked = true));

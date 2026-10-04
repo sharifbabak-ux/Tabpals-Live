@@ -15,6 +15,7 @@ export function loadConfig(env = process.env, overrides = {}) {
       createPerHour: 20, // per IP, POST /v1/events
       redeemFailPer15Min: 10, // per IP, failed redeems only
       opsPerMin: 120, // per device, POST ops
+      envelopesPerMin: 30, // per device, POST key-envelopes
     },
     log: true,
     ...overrides,

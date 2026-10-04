@@ -4,7 +4,12 @@ export const ROLES = ['admin', 'treasurer', 'member'];
 
 export const OP_TYPES = ['create', 'update', 'delete', 'archive', 'restore', 'purge', 'logSend'];
 
-// Writable only by treasurer or admin.
+// Sensitive field values may be end-to-end encrypted opaque strings; the server stores them verbatim
+// (subject to the normal op size limit) and never inspects or logs them.
+export const ENC_PREFIX = 'enc:v1:';
+export const isEncryptedValue = (v) => typeof v === 'string' && v.startsWith(ENC_PREFIX);
+
+// Writable only by treasurer or admin. Any of their fields may carry encrypted values.
 export const LEDGER_ENTITIES = [
   'events',
   'persons',
@@ -30,6 +35,7 @@ export const ACTION_ROLES = {
   'members.add': ['admin', 'treasurer'],
   'roles.set': ['admin'],
   'invites.manage': ['admin'],
+  'members.remove': ['admin'], // also covers restore
   'devices.listAll': ['admin'],
   'devices.revokeAny': ['admin'], // a device may always revoke itself
   'audit.read': ['admin'],
