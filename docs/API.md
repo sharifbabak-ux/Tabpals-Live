@@ -21,7 +21,9 @@ A member holds one or more of `admin`, `treasurer`, `member`. Roles are checked 
 | Read all ops / members of the event | ✔ | ✔ | ✔ |
 | Write ledger ops: `events`, `persons`, `eventMembers`, `vouchers`, `statements`, `orderSessions`, `sessionMenuItems`, `orderLines`, `orderPersonTotals`, `sessionExtras` | ✔ | ✔ | ✘ |
 | Write `memberProfile` op with `entityId` = own memberId | ✔ | ✔ | ✔ |
-| Write `memberProfile` op for someone else | ✔ | ✘ | ✘ |
+| Write `memberProfile` op for someone else | ✔ | ✔ | ✘ |
+| Receive `memberProfile` ops (GET ops, socket `ops`) of own memberId | ✔ | ✔ | ✔ |
+| Receive `memberProfile` ops of other members | ✔ | ✔ | ✘ |
 | Op `type: "purge"` on entity `events` | ✔ | ✘ | ✘ |
 | Add member | ✔ | ✔ | ✘ |
 | Change roles, create/revoke invites, view audit log, list all devices, revoke any device, purge event | ✔ | ✘ | ✘ |
@@ -29,9 +31,11 @@ A member holds one or more of `admin`, `treasurer`, `member`. Roles are checked 
 | List own devices, revoke own device | ✔ | ✔ | ✔ |
 | Register own device public key, list devices awaiting a key, deliver a key envelope, fetch own envelope | ✔ | ✔ | ✔ |
 
+**`memberProfile` is a restricted entity.** Its ops are delivered (by `GET ops` and the socket `ops` event) only to devices of the owning member (`entityId` = memberId) and of members who currently hold `admin` or `treasurer`; other devices never receive them. Filtering uses the live roles, so a role change applies immediately, including to open sockets. As a consequence **`seq` values seen by a client can have gaps** — clients must tolerate gaps (never treat a missing seq as data loss; use `hasMore`/`lastSeq` to page). The writer still sees the seq of its own accepted ops in the POST response.
+
 Rules: an event always has ≥ 1 admin (`409 last-admin` when demoting the last one). Allowed op `type`s: `create, update, delete, archive, restore, purge, logSend`. Unknown entity/type is rejected with a reason.
 
-Field values that are strings starting with `enc:v1:` are opaque end-to-end-encrypted ciphertext. This applies to `memberProfile` and to every ledger entity (`events`, `persons`, `eventMembers`, `vouchers`, `statements`, `orderSessions`, `sessionMenuItems`, `orderLines`, `orderPersonTotals`, `sessionExtras`). The server stores them verbatim (the normal 64 KB op limit still applies) and never logs or inspects them. Permissions are unchanged.
+Field values that are strings starting with `enc:v1:` are opaque end-to-end-encrypted ciphertext. This applies to `memberProfile` and to every ledger entity (`events`, `persons`, `eventMembers`, `vouchers`, `statements`, `orderSessions`, `sessionMenuItems`, `orderLines`, `orderPersonTotals`, `sessionExtras`). The server stores them verbatim (the normal 64 KB op limit still applies) and never logs or inspects them. Ledger write permissions are unchanged.
 
 ### End-to-end encryption model
 Each online event has a 256-bit AES-GCM event key that only member devices hold; **the server never receives it**. A device registers an ECDH P-256 public key. A device that already holds the event key wraps it for a new device and posts the result as an opaque *key envelope*; the server only relays it. Flow: new device registers `publicKey` (on create, on redeem, or `PUT /v1/devices/me/public-key`) → members get socket `key-needed` / poll `awaiting-key` → a key-holding device posts `key-envelopes` → target gets `key-delivered` and fetches `GET /v1/devices/me/key-envelope`. Note `awaiting-key` also lists devices that created the key themselves (they have a public key but no envelope); clients should skip their own device and devices they know already hold the key.
@@ -69,7 +73,7 @@ Idempotent by op `id` per event: re-sending an already stored op returns it in `
 { "ops": [{"seq": 42, "serverTs": "2026-...Z", "memberId": "p1", "deviceId": "...", "op": { /* original client op */ }}],
   "hasMore": false, "lastSeq": 42 }
 ```
-`lastSeq` = seq of the last returned op, or `after` if none. Loop while `hasMore`, passing `after=lastSeq`. Store `lastSeq` locally; call this after every socket reconnect.
+`lastSeq` = seq of the last returned op, or `after` if none. Restricted ops (see above) are filtered out for devices that may not read them, so seqs may skip numbers. Loop while `hasMore`, passing `after=lastSeq`. Store `lastSeq` locally; call this after every socket reconnect.
 
 ### `GET /v1/me`
 `{ eventId, memberId, roles, deviceId, eventTitle, displayName }` for the calling device.
@@ -120,7 +124,7 @@ Body `{ targetDeviceId, wrappedKey, meta }`: `wrappedKey` opaque string ≤ 4 KB
 `{ fromDeviceId, wrappedKey, meta, createdAt }` for the calling device, or `404 not-found`. Sent with `Cache-Control: no-store`.
 
 ### `GET /v1/events/:eventId/audit?limit=<n>&before=<id>` — admin
-Newest first, `limit` default 50, max 200. `{ "entries": [{id, actorMember, actorDevice, action, target, details, at}], "nextBefore": 123 | null }` — pass `nextBefore` as `before` for the next page. Actions: `event.created`, `member.added`, `member.removed`, `member.restored`, `roles.changed`, `invite.created`, `invite.redeemed`, `invite.revoked`, `device.revoked`, `key.delivered`, `statement.sent`. `statement.sent` is written for each newly accepted op of type `logSend` and holds only `statementId` (= op `entityId`, also the entry `target`), `targetMemberId`, `channel` and `timestamp` (looked up in `op.changes` / op top level; must be short plain ids, anything else is dropped; no other payload field is ever copied). Details contain only ids/role names — never bank data or message content. (Purge deletes the audit log with everything else.)
+Newest first, `limit` default 50, max 200. `{ "entries": [{id, actorMember, actorDevice, action, target, details, at}], "nextBefore": 123 | null }` — pass `nextBefore` as `before` for the next page. Actions: `event.created`, `member.added`, `member.removed`, `member.restored`, `roles.changed`, `invite.created`, `invite.redeemed`, `invite.revoked`, `device.revoked`, `key.delivered`, `statement.sent`. `statement.sent` is written for each newly accepted op of type `logSend` and holds only `statementId` (= op `entityId`, also the entry `target`), `targetMemberId`, `channel` and `timestamp`. Documented op shape: `{entity: "statements", entityId: <statementId>, type: "logSend", changes: {targetMemberId: {after: "<memberId>"}, channel: {after: "<channel>"}}, timestamp}`. For robustness the server also accepts the flat form (`changes.targetMemberId: "…"`) and top-level fields, plus the aliases `memberId`/`personId`/`recipientId`; values must be short plain ids (`[\w.:-]{1,128}`), anything else is dropped; no other payload field is ever copied. Details contain only ids/role names — never bank data or message content. (Purge deletes the audit log with everything else.)
 
 ### `DELETE /v1/events/:eventId` — admin
 Deletes **all** rows of the event (ops, members, roles, devices, key envelopes, invites, audit) in one transaction → `{ok: true}`; sockets get `event-purged` and are disconnected. Afterwards every token of the event gets `401 unauthorized`.
@@ -138,7 +142,7 @@ A rejected handshake fires `connect_error` with `err.data.code` = `unauthorized`
 | Event | Payload | When |
 |---|---|---|
 | `ready` | `{eventId, memberId, roles}` | after connect |
-| `ops` | `{ops: [{seq, serverTs, memberId, deviceId, op}], lastSeq}` | newly accepted ops (also to the sender; skip ops you already know by `op.id`). Not sent for duplicates |
+| `ops` | `{ops: [{seq, serverTs, memberId, deviceId, op}], lastSeq}` | newly accepted ops, filtered per device (restricted `memberProfile` ops are omitted for devices not allowed to read them; the event is not sent at all if nothing is left) (also to the sender; skip ops you already know by `op.id`). Not sent for duplicates |
 | `roles-changed` | `{memberId, roles}` | roles updated |
 | `device-revoked` | `{deviceId}` | this device was revoked; socket then closes |
 | `event-purged` | `{eventId}` | event deleted; socket then closes |

@@ -278,3 +278,56 @@ test('encrypted ledger values are stored verbatim', async (t) => {
   const huge = makeOp({ entity: 'persons', type: 'update', changes: { name: { after: 'enc:v1:' + 'A'.repeat(70000) } } });
   assert.equal((await srv.call('POST', ev(eventId, '/ops'), { token: alice, body: { ops: [huge] } })).body.rejected[0].reason, 'op-too-large');
 });
+
+test('memberProfile ops are delivered only to owner, treasurer and admin (GET and socket)', async (t) => {
+  const srv = await startServer(t);
+  const { eventId, alice, bob, carol } = await seedEvent(srv); // alice admin+treasurer; bob, carol plain members
+  const profile = (id, v) => makeOp({ entity: 'memberProfile', entityId: id, type: 'update', changes: { iban: { before: null, after: v } } });
+  const post = (token, ops) => srv.call('POST', ev(eventId, '/ops'), { token, body: { ops } });
+  const seen = {};
+  const sockets = {};
+  for (const [name, token] of Object.entries({ alice, bob, carol })) {
+    seen[name] = [];
+    sockets[name] = await connected(srv, token);
+    sockets[name].on('ops', (m) => seen[name].push(...m.ops.map((o) => o.op.id)));
+  }
+  const pBob = profile('bob', 'enc:v1:BOB');
+  const pCarol = profile('carol', 'enc:v1:CAROL');
+  const marker = makeOp(); // public ledger op sent last as a barrier
+  assert.equal((await post(bob, [pBob])).body.accepted.length, 1);
+  assert.equal((await post(carol, [pCarol])).body.accepted.length, 1);
+  assert.equal((await post(alice, [marker])).body.accepted.length, 1);
+  for (const n of ['alice', 'bob', 'carol']) while (!seen[n].includes(marker.id)) await new Promise((r) => setTimeout(r, 20));
+
+  assert.deepEqual(seen.bob, [pBob.id, marker.id]); // never carol's profile
+  assert.deepEqual(seen.carol, [pCarol.id, marker.id]);
+  assert.deepEqual(seen.alice, [pBob.id, pCarol.id, marker.id]); // admin+treasurer sees all
+
+  const ids = async (token) => {
+    const r = await srv.call('GET', ev(eventId, '/ops?limit=1'), { token });
+    const all = [];
+    let after = 0;
+    for (let i = 0, more = true; more && i < 10; i++) {
+      const p = (await srv.call('GET', ev(eventId, `/ops?after=${after}&limit=1`), { token })).body;
+      all.push(...p.ops.map((o) => o.op.id));
+      after = p.lastSeq;
+      more = p.hasMore;
+    }
+    assert.equal(r.status, 200);
+    return all;
+  };
+  assert.deepEqual(await ids(bob), [pBob.id, marker.id]);
+  assert.deepEqual(await ids(carol), [pCarol.id, marker.id]);
+  assert.deepEqual(await ids(alice), [pBob.id, pCarol.id, marker.id]);
+  const rawBob = JSON.stringify((await srv.call('GET', ev(eventId, '/ops'), { token: bob })).body);
+  assert.ok(!rawBob.includes('CAROL'));
+
+  // Treasurer (without admin) can read and write others' profiles, live on the open socket.
+  await srv.call('PUT', ev(eventId, '/members/bob/roles'), { token: alice, body: { roles: ['treasurer'] } });
+  assert.deepEqual(await ids(bob), [pBob.id, pCarol.id, marker.id]);
+  const pCarol2 = profile('carol', 'enc:v1:CAROL2');
+  assert.equal((await post(bob, [pCarol2])).body.accepted.length, 1); // treasurer may write another member's profile
+  while (!seen.carol.includes(pCarol2.id)) await new Promise((r) => setTimeout(r, 20));
+  assert.ok(seen.bob.includes(pCarol2.id));
+  assert.equal((await post(carol, [profile('bob', 'enc:v1:X')])).body.rejected[0].reason, 'forbidden-profile'); // plain member still can't
+});

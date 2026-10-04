@@ -5,7 +5,7 @@ import { authMiddleware, requireEventMember } from './auth.js';
 import { audit } from './audit.js';
 import { lockEvent } from './db.js';
 import { newId, newShortCode, newToken, normalizeShortCode, sha256 } from './crypto.js';
-import { ROLES, can, checkOp } from './permissions.js';
+import { ROLES, can, checkOp, hasAny } from './permissions.js';
 
 export const MAX_OPS_PER_BATCH = 500;
 export const MAX_OP_BYTES = 64 * 1024;
@@ -290,10 +290,13 @@ export function buildRouter({ db, config, hub }) {
       const limit = req.query.limit === undefined ? 200 : Number(req.query.limit);
       need(Number.isInteger(after) && after >= 0, 'after');
       need(Number.isInteger(limit) && limit >= 1 && limit <= MAX_OPS_PER_BATCH, 'limit');
+      // memberProfile ops are delivered only to the owner, treasurers and admins (seq gaps are expected).
+      const restricted = !hasAny(req.device.roles, ['admin', 'treasurer']);
       const rows = await db.query(
         `SELECT seq, server_ts, member_id, device_id, payload FROM ops
-         WHERE event_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3`,
-        [req.params.eventId, after, limit + 1],
+         WHERE event_id = $1 AND seq > $2 ${restricted ? "AND (entity <> 'memberProfile' OR entity_id = $4)" : ''}
+         ORDER BY seq ASC LIMIT $3`,
+        restricted ? [req.params.eventId, after, limit + 1, req.device.memberId] : [req.params.eventId, after, limit + 1],
       );
       const hasMore = rows.length > limit;
       const ops = rows.slice(0, limit).map(opView);

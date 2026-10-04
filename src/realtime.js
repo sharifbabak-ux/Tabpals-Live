@@ -1,6 +1,7 @@
 import { Server } from 'socket.io';
 import { authenticateToken } from './auth.js';
 import { ApiError } from './errors.js';
+import { canReadOp } from './permissions.js';
 
 const eventRoom = (id) => `event:${id}`;
 const deviceRoom = (id) => `device:${id}`;
@@ -33,8 +34,22 @@ export function attachRealtime(httpServer, { db, config }) {
   });
 
   const hub = {
-    opsAccepted: (eventId, ops, lastSeq) => io.to(eventRoom(eventId)).emit('ops', { ops, lastSeq }),
-    rolesChanged: (eventId, memberId, roles) => io.to(eventRoom(eventId)).emit('roles-changed', { memberId, roles }),
+    // Per-socket filtering: restricted entities (memberProfile) only reach their owner, treasurers and admins.
+    opsAccepted(eventId, ops, lastSeq) {
+      for (const socket of io.sockets.sockets.values()) {
+        if (!socket.rooms.has(eventRoom(eventId))) continue;
+        const visible = ops.filter((o) => canReadOp(socket.data.device, o.op));
+        if (visible.length) socket.emit('ops', { ops: visible, lastSeq });
+      }
+    },
+    rolesChanged(eventId, memberId, roles) {
+      // Keep connected sockets' roles current so the filter above uses live permissions.
+      for (const socket of io.sockets.sockets.values()) {
+        const d = socket.data.device;
+        if (d.eventId === eventId && d.memberId === memberId) d.roles = roles;
+      }
+      io.to(eventRoom(eventId)).emit('roles-changed', { memberId, roles });
+    },
     deviceRevoked(deviceId) {
       io.to(deviceRoom(deviceId)).emit('device-revoked', { deviceId });
       io.in(deviceRoom(deviceId)).disconnectSockets(true);

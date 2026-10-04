@@ -95,7 +95,7 @@ test('permission matrix unit checks', () => {
   assert.ok(checkOp(admin, op('orderLines')).ok);
   assert.ok(checkOp(member, op('memberProfile', 'update', 'm1')).ok);
   assert.equal(checkOp(member, op('memberProfile', 'update', 'm2')).reason, 'forbidden-profile');
-  assert.equal(checkOp(treasurer, op('memberProfile', 'update', 'm2')).reason, 'forbidden-profile');
+  assert.ok(checkOp(treasurer, op('memberProfile', 'update', 'm2')).ok);
   assert.ok(checkOp(admin, op('memberProfile', 'update', 'm2')).ok);
   assert.equal(checkOp(admin, op('nothing')).reason, 'unknown-entity');
   assert.equal(checkOp(admin, op('vouchers', 'explode')).reason, 'unknown-type');
