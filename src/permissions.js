@@ -21,13 +21,26 @@ export const LEDGER_ENTITIES = [
   'orderLines',
   'orderPersonTotals',
   'sessionExtras',
+  'settlementGroups',
 ];
 
 // Restricted entity. Writable by the owning member (entityId === own memberId), treasurer and admin.
 // Readable (GET ops and socket `ops`) by the same set of devices only.
 export const PROFILE_ENTITY = 'memberProfile';
 
-export const ENTITIES = [...LEDGER_ENTITIES, PROFILE_ENTITY];
+// One record per member per ordering session. entityId = `order:<sessionId>:<memberId>` where memberId is the
+// SERVER member id. Plain members may write only their own record (create/update/delete); admin and treasurer any.
+export const ORDER_SUBMISSION_ENTITY = 'orderSubmissions';
+const MEMBER_ORDER_OP_TYPES = ['create', 'update', 'delete'];
+
+/** Splits `order:<sessionId>:<memberId>`; null when malformed (wrong prefix, not 3 segments, empty segment). */
+export function parseOrderSubmissionId(entityId) {
+  const parts = typeof entityId === 'string' ? entityId.split(':') : [];
+  if (parts.length !== 3 || parts[0] !== 'order' || !parts[1] || !parts[2]) return null;
+  return { sessionId: parts[1], memberId: parts[2] };
+}
+
+export const ENTITIES = [...LEDGER_ENTITIES, PROFILE_ENTITY, ORDER_SUBMISSION_ENTITY];
 
 // Non-op actions.
 export const ACTION_ROLES = {
@@ -62,6 +75,14 @@ export function checkOp(actor, op) {
   const isAdmin = actor.roles.includes('admin');
   if (op.entity === PROFILE_ENTITY) {
     return canAccessProfile(actor, op.entityId) ? { ok: true } : { ok: false, reason: 'forbidden-profile' };
+  }
+  if (op.entity === ORDER_SUBMISSION_ENTITY) {
+    const id = parseOrderSubmissionId(op.entityId);
+    if (!id) return { ok: false, reason: 'bad-op' };
+    if (hasAny(actor.roles, ['admin', 'treasurer'])) return { ok: true };
+    return id.memberId === actor.memberId && MEMBER_ORDER_OP_TYPES.includes(op.type)
+      ? { ok: true }
+      : { ok: false, reason: 'forbidden-order' };
   }
   if (op.entity === 'events' && op.type === 'purge' && !isAdmin) {
     return { ok: false, reason: 'forbidden-purge' };
