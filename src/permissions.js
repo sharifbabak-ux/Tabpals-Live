@@ -21,6 +21,7 @@ export const LEDGER_ENTITIES = [
   'orderLines',
   'orderPersonTotals',
   'sessionExtras',
+  'settlementGroups',
 ];
 
 // Restricted entity. Writable by the owning member (entityId === own memberId), treasurer and admin.
