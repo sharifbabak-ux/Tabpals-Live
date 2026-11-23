@@ -5,7 +5,7 @@ Base URL (production): `https://api.tabpals.ir` — all JSON endpoints live unde
 ## Conventions
 
 - **Auth**: every endpoint except `POST /v1/events`, `POST /v1/invites/redeem` and `GET /health` needs `Authorization: Bearer <deviceToken>`. The token is returned **once** (event creation or invite redemption); store it securely on the device. The server keeps only its SHA-256.
-- **IDs**: `eventId`, `memberId` match `[A-Za-z0-9_-]{1,64}` (client ULIDs / person ids). Op `id` and `entityId` match `[\w.:-]{1,128}`.
+- **IDs**: `eventId`, `memberId` match `[A-Za-z0-9_-]{1,64}` (client ULIDs / person ids). Op `id` matches `[\w.:-]{1,128}`; `entityId` matches `[\w.:-]{1,200}`.
 - **Errors**: always `{"error": {"code": "<code>", "message": "<Persian default>"}}`. Translate by `code`.
 - **Non-members get `404 event-not-found`** (never 403) for any `/v1/events/:eventId/...` path, whether or not the event exists.
 - **Rate limits** (`429 rate-limited`, standard `RateLimit-*` headers): 600 req/min/IP overall; 20 event creations/hour/IP; 10 *failed* redeems/15 min/IP; 120 ops POSTs/min/device; 30 key-envelope POSTs/min/device.
@@ -20,6 +20,8 @@ A member holds one or more of `admin`, `treasurer`, `member`. Roles are checked 
 |---|:-:|:-:|:-:|
 | Read all ops / members of the event | ✔ | ✔ | ✔ |
 | Write ledger ops: `events`, `persons`, `eventMembers`, `vouchers`, `statements`, `orderSessions`, `sessionMenuItems`, `orderLines`, `orderPersonTotals`, `sessionExtras` | ✔ | ✔ | ✘ |
+| Write `orderSubmissions` op (any `entityId`, any valid op type) | ✔ | ✔ | ✘ |
+| Write `orderSubmissions` op (`create`/`update`/`delete` only) whose `entityId` last segment = own memberId | ✔ | ✔ | ✔ |
 | Write `memberProfile` op with `entityId` = own memberId | ✔ | ✔ | ✔ |
 | Write `memberProfile` op for someone else | ✔ | ✔ | ✘ |
 | Receive `memberProfile` ops (GET ops, socket `ops`) of own memberId | ✔ | ✔ | ✔ |
@@ -31,11 +33,13 @@ A member holds one or more of `admin`, `treasurer`, `member`. Roles are checked 
 | List own devices, revoke own device | ✔ | ✔ | ✔ |
 | Register own device public key, list devices awaiting a key, deliver a key envelope, fetch own envelope | ✔ | ✔ | ✔ |
 
+**`orderSubmissions`** (one record per member per ordering session) uses `entityId = order:<sessionId>:<memberId>`: exactly three `:`-separated non-empty segments, the first literally `order`; anything else is rejected as `bad-op`. `<memberId>` is the sender's **server** member id (the one `GET /v1/me` / the `ready` event report). A plain member may write only records whose last segment equals their own memberId, and only with op types `create`, `update`, `delete`; every other case is rejected per op with `forbidden-order`. `admin` and `treasurer` are exempt and may write any record with any valid op type. All event members receive all `orderSubmissions` ops (no read filter). `orderSessions` permissions are unchanged (admin/treasurer write, members read). The server does not look inside `changes`, does not check `rev` and does not track whether a session is open.
+
 **`memberProfile` is a restricted entity.** Its ops are delivered (by `GET ops` and the socket `ops` event) only to devices of the owning member (`entityId` = memberId) and of members who currently hold `admin` or `treasurer`; other devices never receive them. Filtering uses the live roles, so a role change applies immediately, including to open sockets. As a consequence **`seq` values seen by a client can have gaps** — clients must tolerate gaps (never treat a missing seq as data loss; use `hasMore`/`lastSeq` to page). The writer still sees the seq of its own accepted ops in the POST response.
 
 Rules: an event always has ≥ 1 admin (`409 last-admin` when demoting the last one). Allowed op `type`s: `create, update, delete, archive, restore, purge, logSend`. Unknown entity/type is rejected with a reason.
 
-Field values that are strings starting with `enc:v1:` are opaque end-to-end-encrypted ciphertext. This applies to `memberProfile` and to every ledger entity (`events`, `persons`, `eventMembers`, `vouchers`, `statements`, `orderSessions`, `sessionMenuItems`, `orderLines`, `orderPersonTotals`, `sessionExtras`). The server stores them verbatim (the normal 64 KB op limit still applies) and never logs or inspects them. Ledger write permissions are unchanged.
+Field values that are strings starting with `enc:v1:` are opaque end-to-end-encrypted ciphertext. This applies to `memberProfile` and to every ledger entity (`events`, `persons`, `eventMembers`, `vouchers`, `statements`, `orderSessions`, `sessionMenuItems`, `orderLines`, `orderPersonTotals`, `sessionExtras`) and to `orderSubmissions`. The server stores them verbatim (the normal 64 KB op limit still applies) and never logs or inspects them. Ledger write permissions are unchanged.
 
 ### End-to-end encryption model
 Each online event has a 256-bit AES-GCM event key that only member devices hold; **the server never receives it**. A device registers an ECDH P-256 public key. A device that already holds the event key wraps it for a new device and posts the result as an opaque *key envelope*; the server only relays it. Flow: new device registers `publicKey` (on create, on redeem, or `PUT /v1/devices/me/public-key`) → members get socket `key-needed` / poll `awaiting-key` → a key-holding device posts `key-envelopes` → target gets `key-delivered` and fetches `GET /v1/devices/me/key-envelope`. Note `awaiting-key` also lists devices that created the key themselves (they have a public key but no envelope); clients should skip their own device and devices they know already hold the key.
@@ -65,7 +69,7 @@ Body: `{ "ops": [ <client op>, ... ] }`, each op the full client operation:
   "rejected": [{"opId": "01J...", "reason": "forbidden-entity", "message": "..."}],
   "lastSeq": 57 }
 ```
-Idempotent by op `id` per event: re-sending an already stored op returns it in `accepted` with its original `seq` and is not re-broadcast. `lastSeq` is the event's highest seq. Op rejection reasons: `bad-op`, `op-too-large`, `unknown-entity`, `unknown-type`, `forbidden-entity`, `forbidden-profile`, `forbidden-purge`. Rejected ops are never stored; don't retry them unchanged. Request-level errors: `400 invalid-field` (empty/missing `ops` or > 500), `413`, `429`.
+Idempotent by op `id` per event: re-sending an already stored op returns it in `accepted` with its original `seq` and is not re-broadcast. `lastSeq` is the event's highest seq. Op rejection reasons: `bad-op`, `op-too-large`, `unknown-entity`, `unknown-type`, `forbidden-entity`, `forbidden-profile`, `forbidden-order`, `forbidden-purge`. Rejected ops are never stored; don't retry them unchanged. Request-level errors: `400 invalid-field` (empty/missing `ops` or > 500), `413`, `429`.
 
 ### `GET /v1/events/:eventId/ops?after=<seq>&limit=<n>` — pull ops (any member)
 `after` default 0; `limit` default 200, max 500. Response:

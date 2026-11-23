@@ -15,7 +15,8 @@ const MAX_WRAPPED_KEY_BYTES = 4096;
 const MAX_ENVELOPE_META_BYTES = 1024;
 
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const ENTITY_ID_RE = /^[\w.:-]{1,128}$/;
+const OP_ID_RE = /^[\w.:-]{1,128}$/;
+const ENTITY_ID_RE = /^[\w.:-]{1,200}$/;
 const str = (v, max) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
 const clean = (v) => v.replace(/[\u0000-\u001f\u007f]/g, '').trim();
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -73,7 +74,7 @@ function toClientTs(v) {
 function validateOp(op) {
   if (!isObj(op)) return { reason: 'bad-op' };
   const clientTs = toClientTs(op.timestamp);
-  if (!ENTITY_ID_RE.test(op.id ?? '') || !ENTITY_ID_RE.test(op.entityId ?? '') || !clientTs) return { reason: 'bad-op' };
+  if (!OP_ID_RE.test(op.id ?? '') || !ENTITY_ID_RE.test(op.entityId ?? '') || !clientTs) return { reason: 'bad-op' };
   if (typeof op.entity !== 'string' || typeof op.type !== 'string') return { reason: 'bad-op' };
   if (op.changes !== undefined && !isObj(op.changes) && !Array.isArray(op.changes)) return { reason: 'bad-op' };
   if (Buffer.byteLength(JSON.stringify(op)) > MAX_OP_BYTES) return { reason: 'op-too-large' };
